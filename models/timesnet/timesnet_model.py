@@ -352,7 +352,7 @@ def main():
         print(f"Device name: {torch.cuda.get_device_name()}")
         
     config = Config(
-        data_path=Path("C:/Users/srb019/Downloads/combined_data.csv"),
+        data_path=Path(r"C:\Users\srb019\foreign_signals_prediction\data\raw\combined_data.csv"),
         performance_output_path=Path("results/metrics/timesnet_metrics.csv"),
         start_date=pd.Timestamp("2010-03-01"),
         device="cuda" if torch.cuda.is_available() else "cpu"
