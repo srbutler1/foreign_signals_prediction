@@ -14,16 +14,7 @@ from dataclasses import dataclass
 import math
 from torch.nn import functional as F
 from datetime import datetime
-
-# Fixed model configuration for TimesNet
-MODEL_CONFIG = {
-    "hidden_dim": 256,
-    "num_kernels": 6,
-    "num_layers": 3,
-    "learning_rate": 1e-3,
-    "weight_decay": 0.01,
-    "dropout": 0.3
-}
+import yaml
 
 @dataclass
 class Config:
@@ -35,9 +26,33 @@ class Config:
     epochs: int = 100
     early_stopping_patience: int = 15
     min_train_samples: int = 252
-    warmup_epochs: int = 10
-    max_seq_length: int = 40
-    feature_dropout: float = 0.2
+    model_params: Dict = None
+
+    def __post_init__(self):
+        if self.model_params is None:
+            self.model_params = {
+                "hidden_dim": 256,
+                "num_kernels": 6,
+                "num_layers": 3,
+                "dropout": 0.3,
+                "learning_rate": 1e-3,
+                "weight_decay": 0.01
+            }
+
+    @classmethod
+    def from_yaml(cls, model_config_path: str, data_config_path: str):
+        with open(model_config_path, 'r') as f:
+            model_dict = yaml.safe_load(f)
+        with open(data_config_path, 'r') as f:
+            data_dict = yaml.safe_load(f)
+            
+        return cls(
+            data_path=Path(data_dict['paths']['data_path']),
+            performance_output_path=Path(data_dict['paths']['performance_output_path']),
+            start_date=pd.Timestamp(data_dict['dates']['start_date']),
+            device=data_dict['hardware']['device'],
+            model_params=model_dict['model']
+        )
 
 class Inception_Block_V1(nn.Module):
     def __init__(self, in_channels, out_channels, num_kernels=6, init_weight=True):
@@ -47,8 +62,7 @@ class Inception_Block_V1(nn.Module):
         self.num_kernels = num_kernels
         kernels = []
         for i in range(self.num_kernels):
-            kernels.append(nn.Conv2d(in_channels, out_channels, 
-                                   kernel_size=2*i+1, padding=i))
+            kernels.append(nn.Conv2d(in_channels, out_channels, kernel_size=2*i+1, padding=i))
         self.kernels = nn.ModuleList(kernels)
         if init_weight:
             self._initialize_weights()
@@ -56,12 +70,10 @@ class Inception_Block_V1(nn.Module):
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', 
-                                      nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x):
-        return torch.stack([kernel(x) for kernel in self.kernels], 
-                         dim=-1).sum(-1)
+        return torch.stack([kernel(x) for kernel in self.kernels], dim=-1).sum(-1)
 
 class TimesBlock(nn.Module):
     def __init__(self, hidden_dim, num_kernels=6):
@@ -102,16 +114,14 @@ class TimesNet(nn.Module):
         )
 
     def forward(self, x):
-        # Embedding and reshape
         x = self.embedding(x)
         x = self.dropout(x)
         
-        # TimesNet blocks with residual connections
         for block in self.times_blocks:
             x = x + block(x)
         
         x = self.norm(x)
-        x = x.mean(dim=1)  # Global average pooling
+        x = x.mean(dim=1)
         return self.head(x)
 
 class StockMetrics:
@@ -183,7 +193,8 @@ class FinancialPredictor:
         return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
 
     def train_epoch(self, model: TimesNet, train_loader: DataLoader, 
-                   optimizer: optim.Optimizer, criterion: nn.Module) -> float:
+                   optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.OneCycleLR,
+                   criterion: nn.Module) -> float:
         model.train()
         total_loss = 0
         
@@ -202,6 +213,7 @@ class FinancialPredictor:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
             
             total_loss += loss.item()
         
@@ -222,9 +234,12 @@ class FinancialPredictor:
                 predictions.extend(output.cpu().numpy())
                 targets.extend(y_batch.cpu().numpy())
         
+        predictions = np.array(predictions)
+        targets = np.array(targets)
         val_loss = total_loss / len(val_loader)
         r2 = r2_score(targets, predictions)
-        return val_loss, r2, np.array(predictions) 
+        
+        return val_loss, r2, predictions
 
     def get_training_windows(self, data: pd.DataFrame) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
         quarters = sorted(data["quarter"].unique())
@@ -285,21 +300,21 @@ class FinancialPredictor:
                     
                     model = TimesNet(
                         input_dim=X_train.shape[1],
-                        hidden_dim=MODEL_CONFIG["hidden_dim"],
-                        num_layers=MODEL_CONFIG["num_layers"],
-                        num_kernels=MODEL_CONFIG["num_kernels"],
-                        dropout=MODEL_CONFIG["dropout"]
+                        hidden_dim=self.config.model_params["hidden_dim"],
+                        num_layers=self.config.model_params["num_layers"],
+                        num_kernels=self.config.model_params["num_kernels"],
+                        dropout=self.config.model_params["dropout"]
                     ).to(self.device)
-                    
+
                     optimizer = optim.AdamW(
                         model.parameters(),
-                        lr=MODEL_CONFIG["learning_rate"],
-                        weight_decay=MODEL_CONFIG["weight_decay"]
+                        lr=self.config.model_params["learning_rate"],
+                        weight_decay=self.config.model_params["weight_decay"]
                     )
                     
                     scheduler = optim.lr_scheduler.OneCycleLR(
                         optimizer,
-                        max_lr=MODEL_CONFIG["learning_rate"],
+                        max_lr=self.config.model_params["learning_rate"],
                         epochs=self.config.epochs,
                         steps_per_epoch=len(train_loader),
                         pct_start=0.1
@@ -311,10 +326,8 @@ class FinancialPredictor:
                     patience_counter = 0
                     
                     for epoch in range(self.config.epochs):
-                        train_loss = self.train_epoch(model, train_loader, optimizer, criterion)
+                        train_loss = self.train_epoch(model, train_loader, optimizer, scheduler, criterion)
                         val_loss, val_r2, predictions = self.validate(model, val_loader, criterion)
-                        
-                        scheduler.step()
                         
                         if val_r2 > best_val_r2:
                             best_val_r2 = val_r2
@@ -340,8 +353,7 @@ class FinancialPredictor:
                 continue
             
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        
-        metrics_df = pd.DataFrame(all_metrics)
+            metrics_df = pd.DataFrame(all_metrics)
         metrics_df.to_csv(self.config.performance_output_path, index=False)
         
         return metrics_df
@@ -351,11 +363,9 @@ def main():
     if torch.cuda.is_available():
         print(f"Device name: {torch.cuda.get_device_name()}")
         
-    config = Config(
-        data_path=Path(r"C:\Users\srb019\foreign_signals_prediction\data\raw\combined_data.csv"),
-        performance_output_path=Path("results/metrics/timesnet_metrics.csv"),
-        start_date=pd.Timestamp("2010-03-01"),
-        device="cuda" if torch.cuda.is_available() else "cpu"
+    config = Config.from_yaml(
+        model_config_path='configs/model_config.yaml',
+        data_config_path='configs/data_config.yaml'
     )
     
     predictor = FinancialPredictor(config)
