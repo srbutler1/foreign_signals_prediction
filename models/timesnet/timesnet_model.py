@@ -15,6 +15,11 @@ import math
 from torch.nn import functional as F
 from datetime import datetime
 import yaml
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent.parent))
+
+from utils import ModelTracker
 
 @dataclass
 class Config:
@@ -192,7 +197,8 @@ class FinancialPredictor:
         self.config = config
         self.device = torch.device(config.device)
         self.logger = self._setup_logger()
-        
+        self.tracker = ModelTracker(Path(__file__).parent.parent.parent)
+
     @staticmethod
     def _setup_logger() -> logging.Logger:
         logger = logging.getLogger('FinancialPredictor')
@@ -300,6 +306,9 @@ class FinancialPredictor:
             if not feature_cols:
                 raise ValueError("No feature columns found matching the expected patterns")
             
+            all_val_true = []
+            all_val_pred = []
+            
             for stock_id in data["permno"].unique():
                 self.logger.info(f"Processing stock {stock_id}")
                 stock_data = data[data["permno"] == stock_id].copy()
@@ -371,6 +380,10 @@ class FinancialPredictor:
                         
                         quarter = val_data['quarter'].iloc[0]
                         stock_metrics.log_quarterly_performance(quarter, best_predictions, y_val)
+                        
+                        # Collect validation predictions and true values
+                        all_val_true.extend(y_val)
+                        all_val_pred.extend(best_predictions)
                     
                     stock_metrics.training_end_time = datetime.now()
                     summary_metrics = stock_metrics.get_summary_metrics()
@@ -385,16 +398,26 @@ class FinancialPredictor:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
+            # Track overall model performance
+            if all_val_true and all_val_pred:
+                self.tracker.save_model_metrics(
+                    model_name="TimesNet",
+                    y_true=np.array(all_val_true),
+                    y_pred=np.array(all_val_pred),
+                    hyperparameters=self.config.model_params,
+                    notes="Full model validation performance",
+                    fold="validation"
+                )
+            
             # Create metrics_df only if we have metrics
             if all_metrics:
                 metrics_df = pd.DataFrame(all_metrics)
-                # Ensure the output directory exists
                 self.config.performance_output_path.parent.mkdir(parents=True, exist_ok=True)
                 metrics_df.to_csv(self.config.performance_output_path, index=False)
                 return metrics_df
             else:
                 self.logger.warning("No metrics were collected. Check if any stocks were processed successfully.")
-                return pd.DataFrame()  # Return empty DataFrame if no metrics collected
+                return pd.DataFrame()
                 
         except Exception as e:
             self.logger.error(f"Fatal error in run_prediction: {str(e)}")
