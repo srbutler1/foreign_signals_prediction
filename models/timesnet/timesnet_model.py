@@ -38,6 +38,15 @@ class Config:
                 "learning_rate": 1e-3,
                 "weight_decay": 0.01
             }
+        
+        # Validate paths
+        if not isinstance(self.data_path, Path):
+            self.data_path = Path(self.data_path)
+        if not isinstance(self.performance_output_path, Path):
+            self.performance_output_path = Path(self.performance_output_path)
+            
+        # Create output directory if it doesn't exist
+        self.performance_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_yaml(cls, model_config_path: str, data_config_path: str):
@@ -78,6 +87,8 @@ class Inception_Block_V1(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         return torch.stack([kernel(x) for kernel in self.kernels], dim=-1).sum(-1)
@@ -119,6 +130,15 @@ class TimesNet(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 1)
         )
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
 
     def forward(self, x):
         x = self.embedding(x)
@@ -206,15 +226,13 @@ class FinancialPredictor:
         total_loss = 0
         
         for X_batch, y_batch in train_loader:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
             
             output = model(X_batch)
             loss = criterion(output, y_batch.view(-1, 1))
             
             # Add L1 regularization
-            l1_reg = 0.
-            for param in model.parameters():
-                l1_reg += torch.norm(param, 1)
+            l1_reg = sum(torch.norm(p, 1) for p in model.parameters())
             loss += 1e-5 * l1_reg
             
             loss.backward()
@@ -241,7 +259,7 @@ class FinancialPredictor:
                 predictions.extend(output.cpu().numpy())
                 targets.extend(y_batch.cpu().numpy())
         
-        predictions = np.array(predictions)
+        predictions = np.array(predictions).reshape(-1)
         targets = np.array(targets)
         val_loss = total_loss / len(val_loader)
         r2 = r2_score(targets, predictions)
@@ -266,125 +284,159 @@ class FinancialPredictor:
 
     def run_prediction(self) -> pd.DataFrame:
         self.logger.info("Starting prediction process...")
+        all_metrics = []  # Initialize empty list for metrics
         
-        data = pd.read_csv(str(self.config.data_path), parse_dates=["date"])
-        data = data[data["date"] >= self.config.start_date].copy()
-        
-        data["quarter"] = data["date"].dt.to_period("Q")
-        data["same_day_return"] = data["ret"]
-        data = data.sort_values(by=["permno", "date"])
-        
-        feature_cols = [col for col in data.columns 
-                       if "Lag" in col or "MA" in col or "StdDev" in col or "EWMA" in col]
-        
-        all_metrics = []
-        
-        for stock_id in data["permno"].unique():
-            self.logger.info(f"Processing stock {stock_id}")
-            stock_data = data[data["permno"] == stock_id].copy()
+        try:
+            data = pd.read_csv(str(self.config.data_path), parse_dates=["date"])
+            data = data[data["date"] >= self.config.start_date].copy()
             
-            if len(stock_data) < self.config.min_train_samples:
-                continue
+            data["quarter"] = data["date"].dt.to_period("Q")
+            data["same_day_return"] = data["ret"]
+            data = data.sort_values(by=["permno", "date"])
             
-            try:
-                stock_metrics = StockMetrics(stock_id)
-                stock_metrics.training_start_time = datetime.now()
+            feature_cols = [col for col in data.columns 
+                           if "Lag" in col or "MA" in col or "StdDev" in col or "EWMA" in col]
+            
+            if not feature_cols:
+                raise ValueError("No feature columns found matching the expected patterns")
+            
+            for stock_id in data["permno"].unique():
+                self.logger.info(f"Processing stock {stock_id}")
+                stock_data = data[data["permno"] == stock_id].copy()
                 
-                windows = self.get_training_windows(stock_data)
+                if len(stock_data) < self.config.min_train_samples:
+                    self.logger.warning(f"Insufficient samples for stock {stock_id}, skipping")
+                    continue
                 
-                for train_data, val_data in windows:
-                    scaler = RobustScaler()
-                    X_train = scaler.fit_transform(train_data[feature_cols])
-                    X_val = scaler.transform(val_data[feature_cols])
+                try:
+                    stock_metrics = StockMetrics(stock_id)
+                    stock_metrics.training_start_time = datetime.now()
                     
-                    y_train = train_data["same_day_return"].values
-                    y_val = val_data["same_day_return"].values
+                    windows = self.get_training_windows(stock_data)
                     
-                    train_weights = np.exp(np.linspace(-1, 0, len(y_train)))
-                    
-                    train_loader = self.create_dataloaders(X_train, y_train, train_weights)
-                    val_loader = self.create_dataloaders(X_val, y_val)
-                    
-                    model = TimesNet(
-                        input_dim=X_train.shape[1],
-                        hidden_dim=self.config.model_params["hidden_dim"],
-                        num_layers=self.config.model_params["num_layers"],
-                        num_kernels=self.config.model_params["num_kernels"],
-                        dropout=self.config.model_params["dropout"]
-                    ).to(self.device)
+                    for train_data, val_data in windows:
+                        scaler = RobustScaler()
+                        X_train = scaler.fit_transform(train_data[feature_cols])
+                        X_val = scaler.transform(val_data[feature_cols])
+                        
+                        y_train = train_data["same_day_return"].values
+                        y_val = val_data["same_day_return"].values
+                        
+                        train_weights = np.exp(np.linspace(-1, 0, len(y_train)))
+                        
+                        train_loader = self.create_dataloaders(X_train, y_train, train_weights)
+                        val_loader = self.create_dataloaders(X_val, y_val)
+                        
+                        model = TimesNet(
+                            input_dim=X_train.shape[1],
+                            hidden_dim=self.config.model_params["hidden_dim"],
+                            num_layers=self.config.model_params["num_layers"],
+                            num_kernels=self.config.model_params["num_kernels"],
+                            dropout=self.config.model_params["dropout"]
+                        ).to(self.device)
 
-                    optimizer = optim.AdamW(
-                        model.parameters(),
-                        lr=self.config.model_params["learning_rate"],
-                        weight_decay=self.config.model_params["weight_decay"]
-                    )
-                    
-                    scheduler = optim.lr_scheduler.OneCycleLR(
-                        optimizer,
-                        max_lr=self.config.model_params["learning_rate"],
-                        epochs=self.config.epochs,
-                        steps_per_epoch=len(train_loader),
-                        pct_start=0.1
-                    )
-                    
-                    criterion = nn.HuberLoss()
-                    best_val_r2 = float('-inf')
-                    best_predictions = None
-                    patience_counter = 0
-                    
-                    for epoch in range(self.config.epochs):
-                        train_loss = self.train_epoch(model, train_loader, optimizer, scheduler, criterion)
-                        val_loss, val_r2, predictions = self.validate(model, val_loader, criterion)
+                        optimizer = optim.AdamW(
+                            model.parameters(),
+                            lr=self.config.model_params["learning_rate"],
+                            weight_decay=self.config.model_params["weight_decay"]
+                        )
                         
-                        if val_r2 > best_val_r2:
-                            best_val_r2 = val_r2
-                            best_predictions = predictions
-                            patience_counter = 0
-                        else:
-                            patience_counter += 1
+                        steps_per_epoch = len(train_loader)
+                        scheduler = optim.lr_scheduler.OneCycleLR(
+                            optimizer,
+                            max_lr=self.config.model_params["learning_rate"],
+                            epochs=self.config.epochs,
+                            steps_per_epoch=steps_per_epoch,
+                            pct_start=0.1
+                        )
                         
-                        if patience_counter >= self.config.early_stopping_patience:
-                            break
+                        criterion = nn.HuberLoss()
+                        best_val_r2 = float('-inf')
+                        best_predictions = None
+                        patience_counter = 0
+                        
+                        for epoch in range(self.config.epochs):
+                            train_loss = self.train_epoch(model, train_loader, optimizer, scheduler, criterion)
+                            val_loss, val_r2, predictions = self.validate(model, val_loader, criterion)
+                            
+                            if val_r2 > best_val_r2:
+                                best_val_r2 = val_r2
+                                best_predictions = predictions
+                                patience_counter = 0
+                            else:
+                                patience_counter += 1
+                            
+                            if patience_counter >= self.config.early_stopping_patience:
+                                break
+                        
+                        quarter = val_data['quarter'].iloc[0]
+                        stock_metrics.log_quarterly_performance(quarter, best_predictions, y_val)
                     
-                    quarter = val_data['quarter'].iloc[0]
-                    stock_metrics.log_quarterly_performance(quarter, best_predictions, y_val)
+                    stock_metrics.training_end_time = datetime.now()
+                    summary_metrics = stock_metrics.get_summary_metrics()
+                    all_metrics.append(summary_metrics)
+                    
+                    self.logger.info(f"Stock {stock_id} R² OOS: {summary_metrics['r2_oos']:.4f}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing stock {stock_id}: {str(e)}")
+                    continue
                 
-                stock_metrics.training_end_time = datetime.now()
-                summary_metrics = stock_metrics.get_summary_metrics()
-                all_metrics.append(summary_metrics)
-                
-                self.logger.info(f"Stock {stock_id} R² OOS: {summary_metrics['r2_oos']:.4f}")
-                
-            except Exception as e:
-                self.logger.error(f"Error processing stock {stock_id}: {str(e)}")
-                continue
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            metrics_df = pd.DataFrame(all_metrics)
-        metrics_df.to_csv(self.config.performance_output_path, index=False)
-        
-        return metrics_df
+            # Create metrics_df only if we have metrics
+            if all_metrics:
+                metrics_df = pd.DataFrame(all_metrics)
+                # Ensure the output directory exists
+                self.config.performance_output_path.parent.mkdir(parents=True, exist_ok=True)
+                metrics_df.to_csv(self.config.performance_output_path, index=False)
+                return metrics_df
+            else:
+                self.logger.warning("No metrics were collected. Check if any stocks were processed successfully.")
+                return pd.DataFrame()  # Return empty DataFrame if no metrics collected
+                
+        except Exception as e:
+            self.logger.error(f"Fatal error in run_prediction: {str(e)}")
+            raise
 
 def main():
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"Device name: {torch.cuda.get_device_name()}")
+    try:
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"Device name: {torch.cuda.get_device_name()}")
         
-    # Get project root directory
-    project_root = Path(__file__).parent.parent.parent
-    
-    config = Config.from_yaml(
-        model_config_path=str(project_root / 'configs' / 'model_config.yaml'),
-        data_config_path=str(project_root / 'configs' / 'data_config.yaml')
-    )
-    
-    predictor = FinancialPredictor(config)
-    metrics_df = predictor.run_prediction()
-    
-    print("\nPrediction Results:")
-    print(f"Total stocks processed: {len(metrics_df)}")
-    print(f"Average R² OOS: {metrics_df['r2_oos'].mean():.4f}")
-    print(f"Stocks with positive R²: {(metrics_df['r2_oos'] > 0).mean()*100:.1f}%")
+        # Get project root directory
+        project_root = Path(__file__).parent.parent.parent
+        
+        # Load configuration
+        try:
+            config = Config.from_yaml(
+                model_config_path=str(project_root / 'configs' / 'model_config.yaml'),
+                data_config_path=str(project_root / 'configs' / 'data_config.yaml')
+            )
+        except FileNotFoundError as e:
+            print(f"Error: Configuration files not found: {e}")
+            return
+        except yaml.YAMLError as e:
+            print(f"Error: Invalid YAML in configuration files: {e}")
+            return
+        
+        # Initialize predictor and run predictions
+        predictor = FinancialPredictor(config)
+        metrics_df = predictor.run_prediction()
+        
+        if not metrics_df.empty:
+            print("\nPrediction Results:")
+            print(f"Total stocks processed: {len(metrics_df)}")
+            print(f"Average R² OOS: {metrics_df['r2_oos'].mean():.4f}")
+            print(f"Stocks with positive R²: {(metrics_df['r2_oos'] > 0).mean()*100:.1f}%")
+        else:
+            print("\nNo results to display. Check the logs for errors.")
+            
+    except Exception as e:
+        print(f"Fatal error in main: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
