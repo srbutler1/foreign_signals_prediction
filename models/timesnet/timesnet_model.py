@@ -45,10 +45,17 @@ class Config:
             model_dict = yaml.safe_load(f)
         with open(data_config_path, 'r') as f:
             data_dict = yaml.safe_load(f)
-            
+        
+        # Get project root
+        project_root = Path(__file__).parent.parent.parent
+        
+        # Handle relative paths
+        data_path = project_root / data_dict['paths']['data_path']
+        performance_path = project_root / data_dict['paths']['performance_output_path']
+                
         return cls(
-            data_path=Path(data_dict['paths']['data_path']),
-            performance_output_path=Path(data_dict['paths']['performance_output_path']),
+            data_path=data_path,
+            performance_output_path=performance_path,
             start_date=pd.Timestamp(data_dict['dates']['start_date']),
             device=data_dict['hardware']['device'],
             model_params=model_dict['model']
@@ -363,9 +370,12 @@ def main():
     if torch.cuda.is_available():
         print(f"Device name: {torch.cuda.get_device_name()}")
         
+    # Get project root directory
+    project_root = Path(__file__).parent.parent.parent
+    
     config = Config.from_yaml(
-        model_config_path='configs/model_config.yaml',
-        data_config_path='configs/data_config.yaml'
+        model_config_path=str(project_root / 'configs' / 'model_config.yaml'),
+        data_config_path=str(project_root / 'configs' / 'data_config.yaml')
     )
     
     predictor = FinancialPredictor(config)
