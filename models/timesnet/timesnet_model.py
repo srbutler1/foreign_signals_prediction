@@ -14,12 +14,12 @@ from dataclasses import dataclass
 import math
 from torch.nn import functional as F
 from datetime import datetime
+import gc
 import yaml
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent.parent))
-
-from utils import ModelTracker
+from utils.model_tracker import ModelTracker
 
 @dataclass
 class Config:
@@ -34,15 +34,6 @@ class Config:
     model_params: Dict = None
 
     def __post_init__(self):
-        if self.model_params is None:
-            self.model_params = {
-                "hidden_dim": 256,
-                "num_kernels": 6,
-                "num_layers": 3,
-                "dropout": 0.3,
-                "learning_rate": 1e-3,
-                "weight_decay": 0.01
-            }
         
         # Validate paths
         if not isinstance(self.data_path, Path):
@@ -271,143 +262,210 @@ class FinancialPredictor:
         r2 = r2_score(targets, predictions)
         
         return val_loss, r2, predictions
-
     def get_training_windows(self, data: pd.DataFrame) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
-        quarters = sorted(data["quarter"].unique())
-        windows = []
+        # Force string conversion at the start
+        data = data.copy()
+        data['quarter'] = data['quarter'].astype(str)
         
-        for i in range(4, len(quarters) - 1):
-            train_quarters = quarters[i-4:i]
+        # Get quarters and ensure they're strings
+        quarters = np.sort(data['quarter'].unique())  # Use numpy sort for consistency
+        self.logger.info(f"DEBUG - All unique quarters: {quarters.tolist()}")
+        
+        windows = []
+        min_quarters = 4  # Minimum quarters needed for training
+        
+        for i in range(min_quarters, len(quarters)):
+            # Get exact string quarters for training and validation
+            train_quarters = quarters[max(0, i-min_quarters):i]
             val_quarter = quarters[i]
             
-            train_data = data[data["quarter"].isin(train_quarters)]
-            val_data = data[data["quarter"] == val_quarter]
+            self.logger.info(f"DEBUG - Window quarters - Train: {train_quarters.tolist()}, Val: {val_quarter}")
+            
+            # Create masks for selection
+            train_mask = data['quarter'].isin(train_quarters)
+            val_mask = data['quarter'] == val_quarter
+            
+            train_data = data[train_mask]
+            val_data = data[val_mask]
+            
+            self.logger.info(f"DEBUG - Window sizes - Train: {len(train_data)}, Val: {len(val_data)}")
             
             if len(train_data) >= self.config.min_train_samples and len(val_data) >= 2:
                 windows.append((train_data, val_data))
         
+        self.logger.info(f"DEBUG - Total windows created: {len(windows)}")
         return windows
-
     def run_prediction(self) -> pd.DataFrame:
         self.logger.info("Starting prediction process...")
-        all_metrics = []  # Initialize empty list for metrics
+        all_metrics = []
         
         try:
-            data = pd.read_csv(str(self.config.data_path), parse_dates=["date"])
-            data = data[data["date"] >= self.config.start_date].copy()
+            # First, read only the columns we need for identifying stocks and dates
+            self.logger.info("Reading initial data info...")
+            df_info = pd.read_csv(str(self.config.data_path), 
+                                usecols=['permno', 'date', 'quarter'],
+                                dtype={'quarter': 'str'},
+                                nrows=1)
             
-            data["quarter"] = data["date"].dt.to_period("Q")
-            data["same_day_return"] = data["ret"]
-            data = data.sort_values(by=["permno", "date"])
+            # Get all column names to identify feature columns
+            all_columns = pd.read_csv(str(self.config.data_path), nrows=0).columns
+            feature_cols = [col for col in all_columns 
+                        if "Lag" in col or "MA" in col or "StdDev" in col or "EWMA" in col]
             
-            feature_cols = [col for col in data.columns 
-                           if "Lag" in col or "MA" in col or "StdDev" in col or "EWMA" in col]
+            # Required columns for the model
+            required_cols = ['permno', 'date', 'quarter', 'ret'] + feature_cols
             
-            if not feature_cols:
-                raise ValueError("No feature columns found matching the expected patterns")
+            # Get unique permnos
+            unique_permnos = []
+            chunk_size = 90000  # Smaller chunk size
+            for chunk in pd.read_csv(str(self.config.data_path), 
+                                usecols=['permno'], 
+                                chunksize=chunk_size):
+                unique_permnos.extend(chunk['permno'].unique())
+            unique_permnos = np.unique(unique_permnos)
             
-            all_val_true = []
-            all_val_pred = []
+            self.logger.info(f"Total stocks to process: {len(unique_permnos)}")
             
-            for stock_id in data["permno"].unique():
-                self.logger.info(f"Processing stock {stock_id}")
-                stock_data = data[data["permno"] == stock_id].copy()
+            # Process stocks in smaller batches
+            batch_size = 10  # Process 10 stocks at a time
+            for batch_start in range(0, len(unique_permnos), batch_size):
+                batch_permnos = unique_permnos[batch_start:batch_start + batch_size]
+                self.logger.info(f"Processing batch of stocks {batch_start} to {batch_start + len(batch_permnos)}")
                 
-                if len(stock_data) < self.config.min_train_samples:
-                    self.logger.warning(f"Insufficient samples for stock {stock_id}, skipping")
+                # Read only required columns for current batch of stocks
+                chunks = []
+                for chunk in pd.read_csv(str(self.config.data_path), 
+                           usecols=required_cols,
+                           dtype={'quarter': str, 'permno': int},  # Explicit types
+                           chunksize=chunk_size):
+                    chunk_filtered = chunk[chunk['permno'].isin(batch_permnos)].copy()
+                    if len(chunk_filtered) > 0:
+                        # Force string type for quarter
+                        chunk_filtered['date'] = pd.to_datetime(chunk_filtered['date'])
+                        chunk_filtered['quarter'] = chunk_filtered['quarter'].astype(str)
+                        chunk_filtered = chunk_filtered[chunk_filtered['date'] >= self.config.start_date]
+                        
+                        self.logger.info(f"DEBUG - Chunk quarter types: {chunk_filtered['quarter'].dtype}")
+                        self.logger.info(f"DEBUG - Sample chunk quarters: {chunk_filtered['quarter'].head().tolist()}")
+                        
+                        if len(chunk_filtered) > 0:
+                            chunks.append(chunk_filtered)
+                    
+                    del chunk_filtered
+                    gc.collect()  # Clear memory after each chunk
+                
+                if not chunks:
                     continue
+                    
+                data = pd.concat(chunks, ignore_index=True)
+                data["same_day_return"] = data["ret"]
+                data = data.sort_values(by=["permno", "date"])
                 
-                try:
-                    stock_metrics = StockMetrics(stock_id)
-                    stock_metrics.training_start_time = datetime.now()
+                # Process each stock in the batch
+                for stock_id in batch_permnos:
+                    self.logger.info(f"Processing stock {stock_id}")
+                    stock_data = data[data["permno"] == stock_id].copy()
                     
-                    windows = self.get_training_windows(stock_data)
+                    if len(stock_data) < self.config.min_train_samples:
+                        self.logger.warning(f"Insufficient samples for stock {stock_id}, skipping")
+                        continue
                     
-                    for train_data, val_data in windows:
-                        scaler = RobustScaler()
-                        X_train = scaler.fit_transform(train_data[feature_cols])
-                        X_val = scaler.transform(val_data[feature_cols])
+                    try:
+                        stock_metrics = StockMetrics(stock_id)
+                        stock_metrics.training_start_time = datetime.now()
                         
-                        y_train = train_data["same_day_return"].values
-                        y_val = val_data["same_day_return"].values
+                        windows = self.get_training_windows(stock_data)
                         
-                        train_weights = np.exp(np.linspace(-1, 0, len(y_train)))
-                        
-                        train_loader = self.create_dataloaders(X_train, y_train, train_weights)
-                        val_loader = self.create_dataloaders(X_val, y_val)
-                        
-                        model = TimesNet(
-                            input_dim=X_train.shape[1],
-                            hidden_dim=self.config.model_params["hidden_dim"],
-                            num_layers=self.config.model_params["num_layers"],
-                            num_kernels=self.config.model_params["num_kernels"],
-                            dropout=self.config.model_params["dropout"]
-                        ).to(self.device)
+                        for train_data, val_data in windows:
+                            scaler = RobustScaler()
+                            X_train = scaler.fit_transform(train_data[feature_cols])
+                            X_val = scaler.transform(val_data[feature_cols])
+                            
+                            y_train = train_data["same_day_return"].values
+                            y_val = val_data["same_day_return"].values
+                            
+                            train_weights = np.exp(np.linspace(-1, 0, len(y_train)))
+                            
+                            train_loader = self.create_dataloaders(X_train, y_train, train_weights)
+                            val_loader = self.create_dataloaders(X_val, y_val)
+                            
+                            model = TimesNet(
+                                input_dim=X_train.shape[1],
+                                hidden_dim=self.config.model_params["hidden_dim"],
+                                num_layers=self.config.model_params["num_layers"],
+                                num_kernels=self.config.model_params["num_kernels"],
+                                dropout=self.config.model_params["dropout"]
+                            ).to(self.device)
 
-                        optimizer = optim.AdamW(
-                            model.parameters(),
-                            lr=self.config.model_params["learning_rate"],
-                            weight_decay=self.config.model_params["weight_decay"]
-                        )
-                        
-                        steps_per_epoch = len(train_loader)
-                        scheduler = optim.lr_scheduler.OneCycleLR(
-                            optimizer,
-                            max_lr=self.config.model_params["learning_rate"],
-                            epochs=self.config.epochs,
-                            steps_per_epoch=steps_per_epoch,
-                            pct_start=0.1
-                        )
-                        
-                        criterion = nn.HuberLoss()
-                        best_val_r2 = float('-inf')
-                        best_predictions = None
-                        patience_counter = 0
-                        
-                        for epoch in range(self.config.epochs):
-                            train_loss = self.train_epoch(model, train_loader, optimizer, scheduler, criterion)
-                            val_loss, val_r2, predictions = self.validate(model, val_loader, criterion)
+                            optimizer = optim.AdamW(
+                                model.parameters(),
+                                lr=self.config.model_params["learning_rate"],
+                                weight_decay=self.config.model_params["weight_decay"]
+                            )
                             
-                            if val_r2 > best_val_r2:
-                                best_val_r2 = val_r2
-                                best_predictions = predictions
-                                patience_counter = 0
-                            else:
-                                patience_counter += 1
+                            steps_per_epoch = len(train_loader)
+                            scheduler = optim.lr_scheduler.OneCycleLR(
+                                optimizer,
+                                max_lr=self.config.model_params["learning_rate"],
+                                epochs=self.config.epochs,
+                                steps_per_epoch=steps_per_epoch,
+                                pct_start=0.1
+                            )
                             
-                            if patience_counter >= self.config.early_stopping_patience:
-                                break
+                            criterion = nn.HuberLoss()
+                            best_val_r2 = float('-inf')
+                            best_predictions = None
+                            patience_counter = 0
+                            
+                            for epoch in range(self.config.epochs):
+                                train_loss = self.train_epoch(model, train_loader, optimizer, 
+                                                            scheduler, criterion)
+                                val_loss, val_r2, predictions = self.validate(model, val_loader, 
+                                                                            criterion)
+                                
+                                if val_r2 > best_val_r2:
+                                    best_val_r2 = val_r2
+                                    best_predictions = predictions
+                                    patience_counter = 0
+                                else:
+                                    patience_counter += 1
+                                
+                                if patience_counter >= self.config.early_stopping_patience:
+                                    break
+                            
+                            quarter = val_data['quarter'].iloc[0]
+                            stock_metrics.log_quarterly_performance(quarter, best_predictions, y_val)
+                            
+                            # Track metrics for the model tracker
+                            self.tracker.save_model_metrics(
+                                model_name="TimesNet",
+                                y_true=y_val,
+                                y_pred=best_predictions,
+                                hyperparameters=self.config.model_params,
+                                notes=f"Stock {stock_id}, Quarter {quarter}",
+                                fold="validation"
+                            )
                         
-                        quarter = val_data['quarter'].iloc[0]
-                        stock_metrics.log_quarterly_performance(quarter, best_predictions, y_val)
+                        stock_metrics.training_end_time = datetime.now()
+                        summary_metrics = stock_metrics.get_summary_metrics()
+                        all_metrics.append(summary_metrics)
                         
-                        # Collect validation predictions and true values
-                        all_val_true.extend(y_val)
-                        all_val_pred.extend(best_predictions)
+                        self.logger.info(f"Stock {stock_id} R² OOS: {summary_metrics['r2_oos']:.4f}")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing stock {stock_id}: {str(e)}")
+                        continue
                     
-                    stock_metrics.training_end_time = datetime.now()
-                    summary_metrics = stock_metrics.get_summary_metrics()
-                    all_metrics.append(summary_metrics)
-                    
-                    self.logger.info(f"Stock {stock_id} R² OOS: {summary_metrics['r2_oos']:.4f}")
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing stock {stock_id}: {str(e)}")
-                    continue
+                    # Clear GPU memory after each stock
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
+                # Clear memory after each batch
+                del data
+                del chunks
+                gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            
-            # Track overall model performance
-            if all_val_true and all_val_pred:
-                self.tracker.save_model_metrics(
-                    model_name="TimesNet",
-                    y_true=np.array(all_val_true),
-                    y_pred=np.array(all_val_pred),
-                    hyperparameters=self.config.model_params,
-                    notes="Full model validation performance",
-                    fold="validation"
-                )
             
             # Create metrics_df only if we have metrics
             if all_metrics:
