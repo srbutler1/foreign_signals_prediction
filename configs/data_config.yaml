@@ -1,0 +1,9 @@
+paths:
+  data_path: "data/raw/combined_data.csv"
+  performance_output_path: "results/metrics/timesnet_metrics.csv"
+
+dates:
+  start_date: "2010-03-01"
+
+hardware:
+  device: "cuda"  # or "cpu"

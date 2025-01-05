@@ -1,0 +1,18 @@
+# Model Configuration
+model:
+  hidden_dim: 256
+  num_kernels: 6
+  num_layers: 3
+  dropout: 0.3
+
+training:
+  learning_rate: 1e-3
+  weight_decay: 0.01
+  batch_size: 2048
+  epochs: 100
+  early_stopping_patience: 15
+
+data:
+  min_train_samples: 252
+  max_seq_length: 40
+  feature_dropout: 0.2
