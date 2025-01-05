@@ -224,7 +224,7 @@ class FinancialPredictor:
         
         val_loss = total_loss / len(val_loader)
         r2 = r2_score(targets, predictions)
-        return val_loss, r2, np.array(predictions)
+        return val_loss, r2, np.array(predictions) 
 
     def get_training_windows(self, data: pd.DataFrame) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
         quarters = sorted(data["quarter"].unique())
