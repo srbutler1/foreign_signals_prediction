@@ -1,41 +1,46 @@
-# foreign_signals_prediction
+# Foreign Signals Prediction
 
-This project implements a machine learning approach to study the impact of foreign information on asset prices, focusing on detecting foreign signals that predict daily U.S. stock returns.
+This project implements and compares different models for predicting foreign market signals.
 
----
+## Project Structure
+```
+.
+├── configs/           # Configuration files
+├── data/             # Data directory
+│   └── raw/          # Raw data files
+├── models/           # Model implementations
+│   ├── baseline/     # Baseline models
+│   ├── experiments/  # Experimental models
+│   └── timesnet/     # TimesNet implementation
+└── results/          # Results and analysis
+    ├── analysis/     # Detailed analysis
+    └── metrics/      # Model metrics
+```
 
-## Project Overview
+## Models
 
-The study analyzes how foreign market information affects U.S. stock returns using neural networks to capture stock-specific time-varying relationships. The implementation includes:
+### TimesNet
+Implementation of the TimesNet architecture for time series prediction. The model uses inception blocks and temporal attention mechanisms to capture complex patterns in financial data.
 
-- Processing of lagged returns from multiple foreign markets
-- Neural network models with dynamic hyperparameter optimization
-- Out-of-sample return predictability analysis
-- Rolling window validation approach
+### Neural Network with Optuna
+Neural network implementation with hyperparameter optimization using Optuna. The model architecture and training parameters are automatically tuned for optimal performance.
 
----
+## Usage
 
-## Features
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-- **Data Preprocessing**: Includes scripts for preparing lagged returns from foreign markets and handling missing data.
-- **Dynamic Neural Network Modeling**: Implements stock-specific neural network models with hyperparameter tuning.
-- **Rolling Window Validation**: Uses rolling window validation for robust out-of-sample testing.
-- **Scalability**: The project is designed to be modular and extensible for additional markets or assets.
+2. Run TimesNet model:
+```bash
+python models/timesnet/timesnet_model.py
+```
 
----
+3. Run Neural Network with Optuna:
+```bash
+python models/experiments/nn_optuna.py
+```
 
-## Prerequisites
-
-Before starting, ensure you have the following installed:
-- Python 3.8+ 
-- pip (Python package manager)
-- Git
-
----
-
-## Setup
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/foreign_signals_prediction.git
-   cd foreign_signals_prediction
+## Model Results
+(This section will be automatically updated by the ModelTracker)
