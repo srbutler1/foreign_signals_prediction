@@ -22,7 +22,7 @@ This project implements and compares different models for predicting foreign mar
 ## Models
 
 ### TimesNet
-Implementation of the TimesNet architecture for time series prediction. The model uses inception blocks and temporal attention mechanisms to capture complex patterns in financial data.
+Implementation of the TimesNet architecture from https://github.com/thuml/TimesNet for time series prediction. The model uses inception blocks and temporal attention mechanisms to capture complex patterns in financial data.
 
 ### Neural Network with Optuna
 Neural network implementation with hyperparameter optimization using Optuna. The model architecture and training parameters are automatically tuned for optimal performance.
