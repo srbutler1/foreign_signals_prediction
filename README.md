@@ -5,16 +5,18 @@ This project implements and compares different models for predicting foreign mar
 ## Project Structure
 ```
 .
-├── configs/           # Configuration files
-├── data/             # Data directory
-│   └── raw/          # Raw data files
-├── models/           # Model implementations
-│   ├── baseline/     # Baseline models
-│   ├── experiments/  # Experimental models
-│   └── timesnet/     # TimesNet implementation
-└── results/          # Results and analysis
-    ├── analysis/     # Detailed analysis
-    └── metrics/      # Model metrics
+├───configs
+├───data
+│   └───raw
+├───models
+│   ├───baseline
+│   ├───experiments
+│   └───timesnet
+├───results
+│   ├───analysis
+│   └───metrics
+└───utils
+    └───__pycache_
 ```
 
 ## Models
