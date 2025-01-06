@@ -1,6 +1,5 @@
 import re
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 def update_readme(readme_path='README.md'):
     with open(readme_path, 'r', encoding='utf-8') as file:
@@ -9,7 +8,10 @@ def update_readme(readme_path='README.md'):
     if '## Last Updated' not in content:
         content += '\n\n## Last Updated\n<!-- LAST_UPDATED -->'
     
-    current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    utc_time = datetime.now(timezone.utc)
+    central_time = utc_time - timedelta(hours=6)
+    current_date = central_time.strftime('%Y-%m-%d %H:%M:%S CST')
+    
     updated_content = re.sub(
         r'## Last Updated\n.*?(?=\n\n|$)', 
         f'## Last Updated\n{current_date}', 
