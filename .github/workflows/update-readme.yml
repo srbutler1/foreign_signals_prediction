@@ -8,18 +8,22 @@ on:
 jobs:
   update-readme:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Update README
         run: python update_readme.py
       - name: Commit changes
+        shell: pwsh
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
           git add README.md
           git commit -m "Update README timestamp" || exit 0
           git push
-        shell: bash

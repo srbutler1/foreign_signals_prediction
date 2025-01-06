@@ -398,6 +398,7 @@ class FinancialPredictor:
                     chunk_filtered = chunk[chunk['permno'].isin(batch_permnos)].copy()
                     if len(chunk_filtered) > 0:
                         chunk_filtered['date'] = pd.to_datetime(chunk_filtered['date'])
+                        chunk_filtered['quarter'] = chunk_filtered['quarter'].astype(str)
                         chunk_filtered = chunk_filtered[chunk_filtered['date'] >= self.config.start_date]
                         if len(chunk_filtered) > 0:
                             chunks.append(chunk_filtered)
