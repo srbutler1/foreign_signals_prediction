@@ -49,21 +49,12 @@ python models/experiments/nn_optuna.py
 
 ## Known Issues and Debug Status
 
-### Current Errors (As of 2025-01-05)
+### Current Errors (As of <!-- LAST_UPDATED -->)
 
-1. **Quarter Processing Issue**
-   - **Error**: Getting repeated quarters ('2010Q1') in debug output
-   - **Status**: Investigating data loading and filtering
-   - **Debug Output**: Sample chunks showing only '2010Q1' quarters
-   - **Next Steps**: 
-     - Add additional debugging for date ranges
-     - Verify quarter column formatting
-     - Check data filtering logic
-
-2. **Data Type Comparison Error**
+1. **Data Type Comparison Error**
    - **Error**: '<=` not supported between instances of 'float' and 'str'
    - **Status**: Working on resolution
-   - **Resolution**: Believe it will ve quarter handling to use string comparisons
+   - **Resolution**: Believe it will be quarter handling to use string comparisons
 
 ### Resolved Issues
 
@@ -71,6 +62,15 @@ python models/experiments/nn_optuna.py
    - **Issue**: Memory errors with large datasets
    - **Resolution**: Implemented chunk-based processing
    - **Implementation**: Using chunks of 90,000 rows and batches of 10 stocks
+
+2. **Quarter Processing Issue**
+   - **Error**: Getting repeated quarters ('2010Q1') in debug output
+   - **Status**: Investigating data loading and filtering
+   - **Debug Output**: Sample chunks showing only '2010Q1' quarters
+   - **Next Steps**: 
+     - Add additional debugging for date ranges
+     - Verify quarter column formatting
+     - Check data filtering logic
 
 ### Debugging Status
 
