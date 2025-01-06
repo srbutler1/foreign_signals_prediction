@@ -34,7 +34,7 @@ class Config:
     model_params: Dict = None
 
     def __post_init__(self):
-        
+
         # Validate paths
         if not isinstance(self.data_path, Path):
             self.data_path = Path(self.data_path)
@@ -262,39 +262,35 @@ class FinancialPredictor:
         r2 = r2_score(targets, predictions)
         
         return val_loss, r2, predictions
+    
     def get_training_windows(self, data: pd.DataFrame) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
-        # Force string conversion at the start
-        data = data.copy()
-        data['quarter'] = data['quarter'].astype(str)
-        
-        # Get quarters and ensure they're strings
-        quarters = np.sort(data['quarter'].unique())  # Use numpy sort for consistency
-        self.logger.info(f"DEBUG - All unique quarters: {quarters.tolist()}")
-        
+        """Create training windows using quarters"""
+        # Only log the first and last windows for each stock
+        quarters = sorted(data['quarter'].unique())
         windows = []
-        min_quarters = 4  # Minimum quarters needed for training
+        stock_id = data['permno'].iloc[0]  # Get the current stock ID
         
-        for i in range(min_quarters, len(quarters)):
-            # Get exact string quarters for training and validation
-            train_quarters = quarters[max(0, i-min_quarters):i]
+        self.logger.info(f"Creating windows for stock {stock_id}")
+        self.logger.info(f"Total quarters available: {len(quarters)} from {quarters[0]} to {quarters[-1]}")
+        
+        for i in range(4, len(quarters) - 1):
+            train_quarters = quarters[i-4:i]
             val_quarter = quarters[i]
             
-            self.logger.info(f"DEBUG - Window quarters - Train: {train_quarters.tolist()}, Val: {val_quarter}")
-            
-            # Create masks for selection
-            train_mask = data['quarter'].isin(train_quarters)
-            val_mask = data['quarter'] == val_quarter
-            
-            train_data = data[train_mask]
-            val_data = data[val_mask]
-            
-            self.logger.info(f"DEBUG - Window sizes - Train: {len(train_data)}, Val: {len(val_data)}")
+            train_data = data[data['quarter'].isin(train_quarters)]
+            val_data = data[data['quarter'] == val_quarter]
             
             if len(train_data) >= self.config.min_train_samples and len(val_data) >= 2:
                 windows.append((train_data, val_data))
+                
+                # Only log first and last window
+                if len(windows) == 1 or i == len(quarters) - 2:
+                    self.logger.info(f"Window {len(windows)}: Train {train_quarters[0]}-{train_quarters[-1]}, Val {val_quarter}")
         
-        self.logger.info(f"DEBUG - Total windows created: {len(windows)}")
+        self.logger.info(f"Created {len(windows)} windows for stock {stock_id}\n")
         return windows
+
+   
     def run_prediction(self) -> pd.DataFrame:
         self.logger.info("Starting prediction process...")
         all_metrics = []
