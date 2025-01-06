@@ -1,13 +1,12 @@
-# Model Configuration
+# model_config.yaml
 model:
   hidden_dim: 256
   num_kernels: 6
   num_layers: 3
   dropout: 0.3
-  learning_rate: 1e-3  # Moved from training section
-  weight_decay: 0.01   # Moved from training section
+  learning_rate: 1e-3
+  weight_decay: 0.01
 
-# Training parameters that aren't part of model_params
 training:
   batch_size: 2048
   epochs: 100

@@ -1,25 +1,32 @@
 import os
+import sys
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import logging
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+import gc
+import yaml
 from pathlib import Path
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
 import math
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from datetime import datetime
-import gc
-import yaml
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
+
 from utils.model_tracker import ModelTracker
+
+
+# 1. CONFIG CLASS & LOADING FROM YAML
 
 @dataclass
 class Config:
@@ -27,46 +34,54 @@ class Config:
     performance_output_path: Path
     start_date: pd.Timestamp
     device: str
-    batch_size: int = 2048
-    epochs: int = 100
-    early_stopping_patience: int = 15
-    min_train_samples: int = 252
-    model_params: Dict = None
+    model_params: Dict
+    training_params: Dict
+    data_params: Dict
 
     def __post_init__(self):
-
         # Validate paths
         if not isinstance(self.data_path, Path):
             self.data_path = Path(self.data_path)
         if not isinstance(self.performance_output_path, Path):
             self.performance_output_path = Path(self.performance_output_path)
-            
+        
         # Create output directory if it doesn't exist
         self.performance_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_yaml(cls, model_config_path: str, data_config_path: str):
+        # Load model config
         with open(model_config_path, 'r') as f:
             model_dict = yaml.safe_load(f)
+        # Load data config
         with open(data_config_path, 'r') as f:
             data_dict = yaml.safe_load(f)
+
         
-        # Get project root
-        project_root = Path(__file__).parent.parent.parent
+        project_root = Path(__file__).resolve().parent.parent.parent
+
         
-        # Handle relative paths
+        # Construct absolute paths
         data_path = project_root / data_dict['paths']['data_path']
-        performance_path = project_root / data_dict['paths']['performance_output_path']
-                
+        perf_path = project_root / data_dict['paths']['performance_output_path']
+        
         return cls(
             data_path=data_path,
-            performance_output_path=performance_path,
+            performance_output_path=perf_path,
             start_date=pd.Timestamp(data_dict['dates']['start_date']),
             device=data_dict['hardware']['device'],
-            model_params=model_dict['model']
+            model_params=model_dict['model'],        # e.g. hidden_dim, dropout, etc.
+            training_params=model_dict['training'],  # e.g. epochs, early_stopping_patience, etc.
+            data_params=model_dict['data']           # e.g. min_train_samples, max_seq_length, etc.
         )
 
+
+# 2. MODEL COMPONENTS
+
 class Inception_Block_V1(nn.Module):
+    """
+    Example Inception-like block from your code.
+    """
     def __init__(self, in_channels, out_channels, num_kernels=6, init_weight=True):
         super(Inception_Block_V1, self).__init__()
         self.in_channels = in_channels
@@ -74,7 +89,7 @@ class Inception_Block_V1(nn.Module):
         self.num_kernels = num_kernels
         kernels = []
         for i in range(self.num_kernels):
-            kernels.append(nn.Conv2d(in_channels, out_channels, kernel_size=2*i+1, padding=i))
+            kernels.append(nn.Conv2d(in_channels, out_channels, kernel_size=2 * i + 1, padding=i))
         self.kernels = nn.ModuleList(kernels)
         if init_weight:
             self._initialize_weights()
@@ -87,9 +102,14 @@ class Inception_Block_V1(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
+        # x shape: (B, C=1, seq_len, hidden_dim) for instance
         return torch.stack([kernel(x) for kernel in self.kernels], dim=-1).sum(-1)
 
+
 class TimesBlock(nn.Module):
+    """
+    One 'TimesBlock' that uses Inception, LayerNorm, and an FFN.
+    """
     def __init__(self, hidden_dim, num_kernels=6):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -102,24 +122,48 @@ class TimesBlock(nn.Module):
         )
 
     def forward(self, x):
-        batch_size, seq_len, _ = x.shape
+        """
+        x: shape (batch_size, seq_len, hidden_dim)
+        """
+        batch_size, seq_len, hidden_dim = x.shape
+        # Normalization
         x = self.layernorm(x)
-        x = x.unsqueeze(1)
-        x = self.conv_layer(x)
-        x = x.permute(0, 2, 3, 1)
+        # Expand channel dimension for Conv2d
+        x = x.unsqueeze(1)  # (B, 1, seq_len, hidden_dim)
+        x = self.conv_layer(x)  # -> shape (B, hidden_dim, seq_len, ???) but we sum along last dim
+        # Permute to (B, seq_len, hidden_dim)
+        x = x.permute(0, 2, 3, 1)  # shape: (B, seq_len, ???, hidden_dim)
+        # Possibly the shape might differ if we need to reshape. We'll assume ??? = 1
+        # We'll reduce along dimension -2
         x = self.ffn(x)
-        x = x.mean(-2)
+        # mean across seq_len dimension (some aggregator)
+        x = x.mean(dim=-2)  # shape: (B, seq_len, hidden_dim) -> (B, ???, hidden_dim)
         return x
 
+
 class TimesNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers=3, num_kernels=6, dropout=0.1):
+    """
+    A TimesNet-inspired model that takes in time series features and produces a single next-day return.
+    """
+    def __init__(self, 
+                 input_dim: int, 
+                 hidden_dim: int = 256, 
+                 num_layers: int = 3, 
+                 num_kernels: int = 6, 
+                 dropout: float = 0.3, 
+                 feature_dropout: float = 0.2):
         super().__init__()
+        # Feature dropout before embedding
+        self.feature_dropout = nn.Dropout(feature_dropout)
         self.embedding = nn.Linear(input_dim, hidden_dim)
+        
         self.times_blocks = nn.ModuleList([
             TimesBlock(hidden_dim, num_kernels) for _ in range(num_layers)
         ])
+        
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
+        
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
@@ -127,27 +171,44 @@ class TimesNet(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
         
-        # Initialize weights
         self.apply(self._init_weights)
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
+            nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
-                torch.nn.init.zeros_(m.bias)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = self.embedding(x)
-        x = self.dropout(x)
+        # x shape: (B, seq_len, input_dim)
+        batch_size, seq_len, input_dim = x.shape
         
+        # Feature dropout: drop some of the input features
+        x = self.feature_dropout(x)
+        
+        # Project input_dim -> hidden_dim
+        x = self.embedding(x)  # (B, seq_len, hidden_dim)
+        x = self.dropout(x)    # additional dropout
+
         for block in self.times_blocks:
-            x = x + block(x)
+            x = x + block(x)  # Residual
+
+        # Final layer norm
+        x = self.norm(x)  
         
-        x = self.norm(x)
-        x = x.mean(dim=1)
+        # Pool across sequence dimension
+        x = x.mean(dim=1)  # shape: (B, hidden_dim)
+        
+        # Output single next-day return
         return self.head(x)
 
+
+# 3. METRICS & LOGGING
+
 class StockMetrics:
+    """
+    Collects and stores metrics for each stock across quarters.
+    """
     def __init__(self, stock_id: int):
         self.stock_id = stock_id
         self.quarterly_metrics = []
@@ -169,7 +230,11 @@ class StockMetrics:
     
     def get_summary_metrics(self):
         df = pd.DataFrame(self.quarterly_metrics)
-        training_time = (self.training_end_time - self.training_start_time).total_seconds()
+        if df.empty:
+            return {}
+        training_time = 0
+        if self.training_start_time and self.training_end_time:
+            training_time = (self.training_end_time - self.training_start_time).total_seconds()
         
         return {
             'stock_id': self.stock_id,
@@ -183,6 +248,9 @@ class StockMetrics:
             'num_quarters': len(df)
         }
 
+
+# 4. MAIN FINANCIAL PREDICTOR CLASS
+
 class FinancialPredictor:
     def __init__(self, config: Config):
         self.config = config
@@ -194,45 +262,50 @@ class FinancialPredictor:
     def _setup_logger() -> logging.Logger:
         logger = logging.getLogger('FinancialPredictor')
         logger.setLevel(logging.INFO)
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(handler)
+        if not logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logger.addHandler(handler)
         return logger
 
-    def create_dataloaders(self, X: np.ndarray, y: np.ndarray, 
-                          sample_weights: np.ndarray = None) -> DataLoader:
+    def create_dataloaders(self, X: np.ndarray, y: np.ndarray, sample_weights: np.ndarray = None) -> DataLoader:
         dataset = TensorDataset(
             torch.FloatTensor(X).to(self.device),
             torch.FloatTensor(y).to(self.device)
         )
-        
+
         if sample_weights is not None:
             sampler = WeightedRandomSampler(
                 weights=sample_weights,
                 num_samples=len(sample_weights),
                 replacement=True
             )
-            return DataLoader(dataset, batch_size=self.config.batch_size, sampler=sampler)
+            return DataLoader(dataset, batch_size=self.config.training_params['batch_size'], sampler=sampler)
         
-        return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
+        return DataLoader(dataset, batch_size=self.config.training_params['batch_size'], shuffle=True)
 
-    def train_epoch(self, model: TimesNet, train_loader: DataLoader, 
-                   optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.OneCycleLR,
-                   criterion: nn.Module) -> float:
+    def train_epoch(self, 
+                    model: TimesNet, 
+                    train_loader: DataLoader, 
+                    optimizer: optim.Optimizer, 
+                    scheduler: optim.lr_scheduler.OneCycleLR,
+                    criterion: nn.Module,
+                    l1_alpha: float = 1e-5) -> float:
         model.train()
-        total_loss = 0
+        total_loss = 0.0
         
         for X_batch, y_batch in train_loader:
-            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
             output = model(X_batch)
             loss = criterion(output, y_batch.view(-1, 1))
             
-            # Add L1 regularization
+            # L1 regularization
             l1_reg = sum(torch.norm(p, 1) for p in model.parameters())
-            loss += 1e-5 * l1_reg
+            loss += l1_alpha * l1_reg
             
             loss.backward()
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
@@ -241,10 +314,12 @@ class FinancialPredictor:
         
         return total_loss / len(train_loader)
 
-    def validate(self, model: TimesNet, val_loader: DataLoader, 
-                criterion: nn.Module) -> Tuple[float, float, np.ndarray]:
+    def validate(self, 
+                 model: TimesNet, 
+                 val_loader: DataLoader, 
+                 criterion: nn.Module) -> Tuple[float, float, np.ndarray]:
         model.eval()
-        total_loss = 0
+        total_loss = 0.0
         predictions = []
         targets = []
         
@@ -253,22 +328,24 @@ class FinancialPredictor:
                 output = model(X_batch)
                 loss = criterion(output, y_batch.view(-1, 1))
                 total_loss += loss.item()
-                predictions.extend(output.cpu().numpy())
-                targets.extend(y_batch.cpu().numpy())
+                predictions.extend(output.cpu().numpy().flatten())
+                targets.extend(y_batch.cpu().numpy().flatten())
         
-        predictions = np.array(predictions).reshape(-1)
+        predictions = np.array(predictions)
         targets = np.array(targets)
         val_loss = total_loss / len(val_loader)
-        r2 = r2_score(targets, predictions)
+        r2 = r2_score(targets, predictions) if len(np.unique(targets)) > 1 else 0
         
         return val_loss, r2, predictions
-    
+
     def get_training_windows(self, data: pd.DataFrame) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
-        """Create training windows using quarters"""
-        # Only log the first and last windows for each stock
+        """
+        Create rolling training windows by quarter.
+        e.g. 4 quarters for training, next quarter for validation, sliding forward.
+        """
         quarters = sorted(data['quarter'].unique())
         windows = []
-        stock_id = data['permno'].iloc[0]  # Get the current stock ID
+        stock_id = data['permno'].iloc[0]
         
         self.logger.info(f"Creating windows for stock {stock_id}")
         self.logger.info(f"Total quarters available: {len(quarters)} from {quarters[0]} to {quarters[-1]}")
@@ -280,131 +357,107 @@ class FinancialPredictor:
             train_data = data[data['quarter'].isin(train_quarters)]
             val_data = data[data['quarter'] == val_quarter]
             
-            if len(train_data) >= self.config.min_train_samples and len(val_data) >= 2:
+            if len(train_data) >= self.config.data_params['min_train_samples'] and len(val_data) >= 2:
                 windows.append((train_data, val_data))
                 
-                # Only log first and last window
+                # Only log the first and last window
                 if len(windows) == 1 or i == len(quarters) - 2:
-                    self.logger.info(f"Window {len(windows)}: Train {train_quarters[0]}-{train_quarters[-1]}, Val {val_quarter}")
+                    self.logger.info(
+                        f"Window {len(windows)}: Train {train_quarters[0]}-{train_quarters[-1]}, Val {val_quarter}"
+                    )
         
         self.logger.info(f"Created {len(windows)} windows for stock {stock_id}\n")
         return windows
 
-   
     def run_prediction(self) -> pd.DataFrame:
         self.logger.info("Starting prediction process...")
         all_metrics = []
         
         try:
-            # First, read only the columns we need for identifying stocks and dates
-            self.logger.info("Reading initial data info...")
-            df_info = pd.read_csv(str(self.config.data_path), 
-                                usecols=['permno', 'date', 'quarter'],
-                                dtype={'quarter': 'str'},
-                                nrows=1)
-            
-            # Get all column names to identify feature columns
-            all_columns = pd.read_csv(str(self.config.data_path), nrows=0).columns
-            feature_cols = [col for col in all_columns 
-                        if "Lag" in col or "MA" in col or "StdDev" in col or "EWMA" in col]
-            
-            # Required columns for the model
-            required_cols = ['permno', 'date', 'quarter', 'ret'] + feature_cols
-            
-            # Get unique permnos
+            # Get unique stock IDs
+            chunk_size = 90000
             unique_permnos = []
-            chunk_size = 90000  # Smaller chunk size
-            for chunk in pd.read_csv(str(self.config.data_path), 
-                                usecols=['permno'], 
-                                chunksize=chunk_size):
+            for chunk in pd.read_csv(str(self.config.data_path), usecols=['permno'], chunksize=chunk_size):
                 unique_permnos.extend(chunk['permno'].unique())
             unique_permnos = np.unique(unique_permnos)
             
             self.logger.info(f"Total stocks to process: {len(unique_permnos)}")
+            total_batches = (len(unique_permnos) + 9) // 10
             
-            # Process stocks in smaller batches
-            batch_size = 10  # Process 10 stocks at a time
-            for batch_start in range(0, len(unique_permnos), batch_size):
+            # Process in batches of 10 stocks
+            batch_size = 10
+            all_val_true, all_val_pred = [], []
+            
+            for batch_idx, batch_start in enumerate(range(0, len(unique_permnos), batch_size)):
                 batch_permnos = unique_permnos[batch_start:batch_start + batch_size]
-                self.logger.info(f"Processing batch of stocks {batch_start} to {batch_start + len(batch_permnos)}")
+                self.logger.info(f"Processing batch {batch_idx + 1}/{total_batches}")
                 
-                # Read only required columns for current batch of stocks
+                # Load batch data
                 chunks = []
-                for chunk in pd.read_csv(str(self.config.data_path), 
-                           usecols=required_cols,
-                           dtype={'quarter': str, 'permno': int},  # Explicit types
-                           chunksize=chunk_size):
+                for chunk in pd.read_csv(str(self.config.data_path), chunksize=chunk_size):
                     chunk_filtered = chunk[chunk['permno'].isin(batch_permnos)].copy()
                     if len(chunk_filtered) > 0:
-                        # Force string type for quarter
                         chunk_filtered['date'] = pd.to_datetime(chunk_filtered['date'])
-                        chunk_filtered['quarter'] = chunk_filtered['quarter'].astype(str)
                         chunk_filtered = chunk_filtered[chunk_filtered['date'] >= self.config.start_date]
-                        
-                        self.logger.info(f"DEBUG - Chunk quarter types: {chunk_filtered['quarter'].dtype}")
-                        self.logger.info(f"DEBUG - Sample chunk quarters: {chunk_filtered['quarter'].head().tolist()}")
-                        
                         if len(chunk_filtered) > 0:
                             chunks.append(chunk_filtered)
-                    
                     del chunk_filtered
-                    gc.collect()  # Clear memory after each chunk
+                    gc.collect()
                 
                 if not chunks:
                     continue
-                    
+                
                 data = pd.concat(chunks, ignore_index=True)
+                feature_cols = [col for col in data.columns 
+                            if any(x in col for x in ['Lag', 'MA', 'StdDev', 'EWMA'])]
                 data["same_day_return"] = data["ret"]
                 data = data.sort_values(by=["permno", "date"])
                 
-                # Process each stock in the batch
                 for stock_id in batch_permnos:
-                    self.logger.info(f"Processing stock {stock_id}")
-                    stock_data = data[data["permno"] == stock_id].copy()
-                    
-                    if len(stock_data) < self.config.min_train_samples:
-                        self.logger.warning(f"Insufficient samples for stock {stock_id}, skipping")
-                        continue
-                    
                     try:
+                        stock_data = data[data["permno"] == stock_id].copy()
+                        if len(stock_data) < self.config.data_params['min_train_samples']:
+                            continue
+                        
                         stock_metrics = StockMetrics(stock_id)
                         stock_metrics.training_start_time = datetime.now()
-                        
                         windows = self.get_training_windows(stock_data)
                         
                         for train_data, val_data in windows:
+                            # Prepare data
                             scaler = RobustScaler()
                             X_train = scaler.fit_transform(train_data[feature_cols])
                             X_val = scaler.transform(val_data[feature_cols])
-                            
                             y_train = train_data["same_day_return"].values
                             y_val = val_data["same_day_return"].values
                             
+                            # Create dataloaders
                             train_weights = np.exp(np.linspace(-1, 0, len(y_train)))
-                            
                             train_loader = self.create_dataloaders(X_train, y_train, train_weights)
                             val_loader = self.create_dataloaders(X_val, y_val)
                             
+                            # Initialize model
                             model = TimesNet(
                                 input_dim=X_train.shape[1],
-                                hidden_dim=self.config.model_params["hidden_dim"],
-                                num_layers=self.config.model_params["num_layers"],
-                                num_kernels=self.config.model_params["num_kernels"],
-                                dropout=self.config.model_params["dropout"]
+                                hidden_dim=self.config.model_params['hidden_dim'],
+                                num_layers=self.config.model_params['num_layers'],
+                                num_kernels=self.config.model_params['num_kernels'],
+                                dropout=self.config.model_params['dropout'],
+                                feature_dropout=self.config.data_params['feature_dropout']
                             ).to(self.device)
-
+                            
+                            # Training setup
                             optimizer = optim.AdamW(
                                 model.parameters(),
-                                lr=self.config.model_params["learning_rate"],
-                                weight_decay=self.config.model_params["weight_decay"]
+                                lr=self.config.model_params['learning_rate'],
+                                weight_decay=self.config.model_params['weight_decay']
                             )
                             
-                            steps_per_epoch = len(train_loader)
                             scheduler = optim.lr_scheduler.OneCycleLR(
                                 optimizer,
-                                max_lr=self.config.model_params["learning_rate"],
-                                epochs=self.config.epochs,
-                                steps_per_epoch=steps_per_epoch,
+                                max_lr=self.config.model_params['learning_rate'],
+                                epochs=self.config.training_params['epochs'],
+                                steps_per_epoch=len(train_loader),
                                 pct_start=0.1
                             )
                             
@@ -413,11 +466,14 @@ class FinancialPredictor:
                             best_predictions = None
                             patience_counter = 0
                             
-                            for epoch in range(self.config.epochs):
-                                train_loss = self.train_epoch(model, train_loader, optimizer, 
-                                                            scheduler, criterion)
-                                val_loss, val_r2, predictions = self.validate(model, val_loader, 
-                                                                            criterion)
+                            # Training loop
+                            for epoch in range(self.config.training_params['epochs']):
+                                train_loss = self.train_epoch(
+                                    model, train_loader, optimizer, scheduler, criterion
+                                )
+                                val_loss, val_r2, predictions = self.validate(
+                                    model, val_loader, criterion
+                                )
                                 
                                 if val_r2 > best_val_r2:
                                     best_val_r2 = val_r2
@@ -426,13 +482,14 @@ class FinancialPredictor:
                                 else:
                                     patience_counter += 1
                                 
-                                if patience_counter >= self.config.early_stopping_patience:
+                                if patience_counter >= self.config.training_params['early_stopping_patience']:
                                     break
                             
+                            # Log performance
                             quarter = val_data['quarter'].iloc[0]
                             stock_metrics.log_quarterly_performance(quarter, best_predictions, y_val)
                             
-                            # Track metrics for the model tracker
+                            # Track metrics
                             self.tracker.save_model_metrics(
                                 model_name="TimesNet",
                                 y_true=y_val,
@@ -441,7 +498,12 @@ class FinancialPredictor:
                                 notes=f"Stock {stock_id}, Quarter {quarter}",
                                 fold="validation"
                             )
+                            
+                            # Collect all predictions
+                            all_val_true.extend(y_val)
+                            all_val_pred.extend(best_predictions)
                         
+                        # Summarize stock performance
                         stock_metrics.training_end_time = datetime.now()
                         summary_metrics = stock_metrics.get_summary_metrics()
                         all_metrics.append(summary_metrics)
@@ -452,68 +514,75 @@ class FinancialPredictor:
                         self.logger.error(f"Error processing stock {stock_id}: {str(e)}")
                         continue
                     
-                    # Clear GPU memory after each stock
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 
-                # Clear memory after each batch
-                del data
-                del chunks
+                # Cleanup batch data
+                del data, chunks
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
-            # Create metrics_df only if we have metrics
+            # Save overall metrics
             if all_metrics:
                 metrics_df = pd.DataFrame(all_metrics)
-                self.config.performance_output_path.parent.mkdir(parents=True, exist_ok=True)
                 metrics_df.to_csv(self.config.performance_output_path, index=False)
+                
+                # Track overall model performance
+                if all_val_true and all_val_pred:
+                    self.tracker.save_model_metrics(
+                        model_name="TimesNet",
+                        y_true=np.array(all_val_true),
+                        y_pred=np.array(all_val_pred),
+                        hyperparameters=self.config.model_params,
+                        notes="Full model validation performance",
+                        fold="validation"
+                    )
+                
                 return metrics_df
             else:
-                self.logger.warning("No metrics were collected. Check if any stocks were processed successfully.")
+                self.logger.warning("No metrics collected")
                 return pd.DataFrame()
                 
         except Exception as e:
             self.logger.error(f"Fatal error in run_prediction: {str(e)}")
             raise
 
+
+# 5. MAIN FUNCTION
+
 def main():
     try:
         print(f"CUDA available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
-            print(f"Device name: {torch.cuda.get_device_name()}")
-        
-        # Get project root directory
+            print(f"Device name: {torch.cuda.get_device_name(0)}")
+
+        # Adjust these paths to where your configs live
         project_root = Path(__file__).parent.parent.parent
-        
-        # Load configuration
-        try:
-            config = Config.from_yaml(
-                model_config_path=str(project_root / 'configs' / 'model_config.yaml'),
-                data_config_path=str(project_root / 'configs' / 'data_config.yaml')
-            )
-        except FileNotFoundError as e:
-            print(f"Error: Configuration files not found: {e}")
-            return
-        except yaml.YAMLError as e:
-            print(f"Error: Invalid YAML in configuration files: {e}")
-            return
-        
-        # Initialize predictor and run predictions
+        model_config_path = project_root / 'configs' / 'model_config.yaml'
+        data_config_path = project_root / 'configs' / 'data_config.yaml'
+
+        # Load Config
+        config = Config.from_yaml(
+            model_config_path=str(model_config_path),
+            data_config_path=str(data_config_path)
+        )
+
         predictor = FinancialPredictor(config)
         metrics_df = predictor.run_prediction()
         
         if not metrics_df.empty:
-            print("\nPrediction Results:")
+            print("\n=== Final Prediction Results ===")
             print(f"Total stocks processed: {len(metrics_df)}")
             print(f"Average R² OOS: {metrics_df['r2_oos'].mean():.4f}")
-            print(f"Stocks with positive R²: {(metrics_df['r2_oos'] > 0).mean()*100:.1f}%")
+            print(f"Fraction of Stocks with Positive R²: {(metrics_df['r2_oos'] > 0).mean() * 100:.1f}%")
         else:
-            print("\nNo results to display. Check the logs for errors.")
-            
+            print("\nNo results to display. Check the logs for more details.")
+
     except Exception as e:
         print(f"Fatal error in main: {str(e)}")
         raise
+
 
 if __name__ == "__main__":
     main()
