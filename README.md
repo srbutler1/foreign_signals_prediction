@@ -90,4 +90,4 @@ self.logger.info(f"DEBUG - Number of rows in chunk: {len(chunk_filtered)}")
 
 
 ## Last Updated
-2025-01-06 11:02:00 CST
+2025-01-06 11:05:12 CST
