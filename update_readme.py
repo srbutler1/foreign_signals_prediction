@@ -1,6 +1,7 @@
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+import pytz
 
 def update_readme(readme_path='README.md'):
     with open(readme_path, 'r', encoding='utf-8') as file:
@@ -9,7 +10,8 @@ def update_readme(readme_path='README.md'):
     if '## Last Updated' not in content:
         content += '\n\n## Last Updated\n<!-- LAST_UPDATED -->'
     
-    current_date = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    central_tz = pytz.timezone('US/Central')
+    current_date = datetime.now(central_tz).strftime('%Y-%m-%d %H:%M:%S UTC')
     updated_content = re.sub(
         r'## Last Updated\n.*?(?=\n\n|$)', 
         f'## Last Updated\n{current_date}', 
