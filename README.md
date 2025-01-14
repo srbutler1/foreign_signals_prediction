@@ -1,6 +1,6 @@
 # A Note from Sam
 
-This repository is not entirely up to speed and is a work in progress for tracking model performance. An evaluation of frontier models on a similar dataset from the [Foreign Signals Radar by Wei Jiao] (https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4822651) is the primary intention. 
+This repository is not entirely up to speed and is a work in progress for tracking model performance. An evaluation of frontier models on a similar dataset from the [Foreign Signals Radar by Wei Jiao](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4822651) is the primary intention. 
 
 
 # Foreign Signals Prediction
