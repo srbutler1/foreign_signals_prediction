@@ -1,6 +1,6 @@
 # Foreign Signals Prediction
 
-This project implements and compares different models for predicting foreign market signals.
+This project implements and compares different models for predicting next day returns using foreign market signals from around the world. 
 
 ## Project Structure
 ```
